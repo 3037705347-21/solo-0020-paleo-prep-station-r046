@@ -128,6 +128,29 @@
         "repository",
         "contracts"
       ]
+    },
+    {
+      "id": "record-subsample",
+      "name": "Register subsample and material removal",
+      "entry": "POST /materials/{id}/subsamples and POST /materials/{id}/removals",
+      "steps": [
+        "resolve the mother specimen or subsample and its ancestor lineage",
+        "fold duplicate idempotency keys to the first committed result",
+        "reject sealed (released/terminated) mothers, duplicate codes, cycles, and insufficient inventory",
+        "commit the removal record, the subsample identity, and mother inventory deduction together"
+      ],
+      "success": "returns the removal record and a subsample carrying mother/plan/step traceability",
+      "failure": "returns conflict for sealed mothers, duplicate codes, cycles, closed plans, or insufficient quantity without orphan records",
+      "verification": "workflowcheck samples from a stocked specimen across multiple levels, replays idempotently, and verifies inventory, termination, and conflict boundaries",
+      "module_ids": [
+        "entrypoint",
+        "runtimecheck",
+        "httpapi",
+        "station",
+        "domain",
+        "repository",
+        "contracts"
+      ]
     }
   ],
   "complexity": {
@@ -135,8 +158,10 @@
       "state_transition",
       "resource_lifetime",
       "error_propagation",
-      "concurrency"
+      "concurrency",
+      "idempotency",
+      "hierarchical_lineage"
     ],
-    "notes": "Plan and specimen state changes share one repository mutation; duplicate catalog numbers and unfinished plans are rejected at commit time."
+    "notes": "Plan and specimen state changes share one repository mutation; duplicate catalog numbers and unfinished plans are rejected at commit time. Material removal, subsample identity and mother inventory are committed atomically; idempotency keys collapse duplicate sampling, and the repository mutex serializes concurrent removals so successes and over-quantity failures have deterministic counts."
   }
 }

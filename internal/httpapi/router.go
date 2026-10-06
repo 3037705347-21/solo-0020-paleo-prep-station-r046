@@ -23,6 +23,15 @@ func NewRouter(service *station.Service) http.Handler {
 	mux.HandleFunc("GET /plans/{id}", api.getPlan)
 	mux.HandleFunc("POST /plans/{id}/approval", api.approvePlan)
 	mux.HandleFunc("POST /plans/{id}/progress", api.logProgress)
+
+	// 材料去除与子样本：母对象标识可以是一级标本，也可以是已有子样本。
+	mux.HandleFunc("POST /materials/{id}/subsamples", api.createSubsample)
+	mux.HandleFunc("GET /materials/{id}/subsamples", api.listSubsamples)
+	mux.HandleFunc("POST /materials/{id}/removals", api.recordRemoval)
+	mux.HandleFunc("GET /materials/{id}/removals", api.listRemovals)
+	mux.HandleFunc("POST /materials/{id}/termination", api.terminateMaterial)
+	mux.HandleFunc("GET /subsamples/{id}", api.getSubsample)
+	mux.HandleFunc("GET /removals/{id}", api.getRemoval)
 	return requestIDMiddleware(mux)
 }
 

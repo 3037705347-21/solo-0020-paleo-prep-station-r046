@@ -25,6 +25,7 @@ func (s *Service) RegisterSpecimen(
 			request.TaxonHint,
 			request.MatrixKind,
 			request.JacketNotes,
+			request.InitialQuantity,
 			s.now(),
 		)
 		if err != nil {
