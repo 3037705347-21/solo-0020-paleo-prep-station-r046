@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"example.com/paleo-prep-station/internal/contracts"
@@ -22,6 +24,7 @@ type specimenView struct {
 	ID            string `json:"id"`
 	CatalogNumber string `json:"catalog_number"`
 	Status        string `json:"status"`
+	StockQuantity int    `json:"stock_quantity"`
 }
 
 type planView struct {
@@ -35,6 +38,46 @@ type planSnapshot struct {
 	Progress []struct {
 		Percent int `json:"percent"`
 	} `json:"progress"`
+}
+
+type removalResultView struct {
+	Removal struct {
+		ID          string `json:"id"`
+		PlanID      string `json:"plan_id"`
+		Step        int    `json:"step"`
+		ParentKind  string `json:"parent_kind"`
+		ParentID    string `json:"parent_id"`
+		SubsampleID string `json:"subsample_id"`
+		Quantity    int    `json:"quantity"`
+	} `json:"removal"`
+	Subsample struct {
+		ID             string `json:"id"`
+		Code           string `json:"code"`
+		RootSpecimenID string `json:"root_specimen_id"`
+		ParentKind     string `json:"parent_kind"`
+		ParentID       string `json:"parent_id"`
+		Quantity       int    `json:"quantity"`
+		Remaining      int    `json:"remaining"`
+	} `json:"subsample"`
+}
+
+type removalEntryView struct {
+	ID          string `json:"id"`
+	Step        int    `json:"step"`
+	SubsampleID string `json:"subsample_id"`
+	Quantity    int    `json:"quantity"`
+}
+
+type subsampleEntryView struct {
+	ID             string `json:"id"`
+	Code           string `json:"code"`
+	RootSpecimenID string `json:"root_specimen_id"`
+	Remaining      int    `json:"remaining"`
+}
+
+type errorView struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 type releaseView struct {
@@ -136,6 +179,8 @@ func run(workflow string) error {
 		}
 		return nil
 
+	case "register-subsample":
+		return checkRegisterSubsample(client, server.URL)
 	case "release-for-study":
 		specimen, plan, err := completedPlanSetup(client, server.URL)
 		if err != nil {
@@ -175,14 +220,239 @@ func run(workflow string) error {
 	}
 }
 
+func checkRegisterSubsample(client *http.Client, baseURL string) error {
+	// Guard: an approved-but-not-started plan must reject material removal.
+	earlySpecimen, err := registerSpecimen(client, baseURL)
+	if err != nil {
+		return err
+	}
+	earlyPlan, err := createPlan(client, baseURL, earlySpecimen.ID)
+	if err != nil {
+		return err
+	}
+	if err := requestJSON(client, http.MethodPost, baseURL+"/plans/"+earlyPlan.ID+"/approval",
+		contracts.ApprovalRequest{ApprovedBy: "curator-lin"}, http.StatusOK, &planView{}); err != nil {
+		return err
+	}
+	if err := expectConflictCode(client, baseURL+"/plans/"+earlyPlan.ID+"/removals",
+		removalRequest("SUB-EARLY", 1, "", ""), "plan_not_accepting_removal"); err != nil {
+		return err
+	}
+
+	// Main lineage: active plan.
+	specimen, plan, err := completedPlanSetup(client, baseURL)
+	if err != nil {
+		return err
+	}
+	if err := recordProgress(client, baseURL, plan.ID, 30, "矩阵初剥"); err != nil {
+		return err
+	}
+
+	first, err := postRemoval(client, baseURL, plan.ID, removalRequest("SUB-A-001", 10, "", ""))
+	if err != nil {
+		return err
+	}
+	if first.Removal.Step != 1 || first.Removal.ParentKind != "specimen" ||
+		first.Removal.ParentID != specimen.ID || first.Removal.SubsampleID != first.Subsample.ID {
+		return errors.New("first removal did not bind plan step, mother specimen and subsample together")
+	}
+	if first.Subsample.RootSpecimenID != specimen.ID || first.Subsample.Remaining != 10 {
+		return errors.New("subsample lineage or initial inventory incorrect")
+	}
+	if err := expectSpecimenStock(client, baseURL, specimen.ID, 90); err != nil {
+		return err
+	}
+
+	// Duplicate sampling code is a conflict and leaves no extra records.
+	if err := expectConflictCode(client, baseURL+"/plans/"+plan.ID+"/removals",
+		removalRequest("SUB-A-001", 1, "", ""), "duplicate_subsample_code"); err != nil {
+		return err
+	}
+
+	// Nested sampling: detach from the first subsample. The mother specimen
+	// inventory is untouched, the parent subsample loses material.
+	nested, err := postRemoval(client, baseURL, plan.ID,
+		removalRequest("SUB-A-001-N1", 3, "subsample", first.Subsample.ID))
+	if err != nil {
+		return err
+	}
+	if nested.Removal.Step != 2 || nested.Subsample.ParentKind != "subsample" ||
+		nested.Subsample.ParentID != first.Subsample.ID || nested.Subsample.RootSpecimenID != specimen.ID {
+		return errors.New("nested subsample lineage is not traceable to the mother specimen")
+	}
+	var parentSample subsampleEntryView
+	if err := requestJSON(client, http.MethodGet, baseURL+"/subsamples/"+first.Subsample.ID, nil,
+		http.StatusOK, &parentSample); err != nil {
+		return err
+	}
+	if parentSample.Remaining != 7 {
+		return fmt.Errorf("expected parent subsample remaining 7, got %d", parentSample.Remaining)
+	}
+	if err := expectSpecimenStock(client, baseURL, specimen.ID, 90); err != nil {
+		return err
+	}
+
+	// Concurrent removals against the same plan serialize into contiguous
+	// steps with exactly-once commits.
+	const concurrent = 5
+	type concurrentOutcome struct {
+		result removalResultView
+		err    error
+	}
+	outcomes := make(chan concurrentOutcome, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			req := removalRequest(fmt.Sprintf("SUB-C-%d", index), 5, "", "")
+			result, err := postRemoval(client, baseURL, plan.ID, req)
+			outcomes <- concurrentOutcome{result: result, err: err}
+		}(i)
+	}
+	wg.Wait()
+	close(outcomes)
+	seenSteps := map[int]bool{}
+	for outcome := range outcomes {
+		if outcome.err != nil {
+			return fmt.Errorf("concurrent removal failed: %w", outcome.err)
+		}
+		if seenSteps[outcome.result.Removal.Step] {
+			return errors.New("concurrent removals produced a duplicated step")
+		}
+		seenSteps[outcome.result.Removal.Step] = true
+	}
+	for step := 3; step < 3+concurrent; step++ {
+		if !seenSteps[step] {
+			return fmt.Errorf("concurrent removals left step %d unassigned", step)
+		}
+	}
+	if err := expectSpecimenStock(client, baseURL, specimen.ID, 65); err != nil {
+		return err
+	}
+
+	// Insufficient stock is rejected; no orphan removal or subsample appears.
+	if err := expectConflictCode(client, baseURL+"/plans/"+plan.ID+"/removals",
+		removalRequest("SUB-OVER", 100, "", ""), "insufficient_stock"); err != nil {
+		return err
+	}
+	var subsampleList struct {
+		Items []subsampleEntryView `json:"items"`
+	}
+	if err := requestJSON(client, http.MethodGet, baseURL+"/specimens/"+specimen.ID+"/subsamples", nil,
+		http.StatusOK, &subsampleList); err != nil {
+		return err
+	}
+	if len(subsampleList.Items) != 2+concurrent {
+		return fmt.Errorf("expected %d subsamples, got %d (orphan or missing records)", 2+concurrent, len(subsampleList.Items))
+	}
+	var removalList struct {
+		Items []removalEntryView `json:"items"`
+	}
+	if err := requestJSON(client, http.MethodGet, baseURL+"/specimens/"+specimen.ID+"/removals", nil,
+		http.StatusOK, &removalList); err != nil {
+		return err
+	}
+	if len(removalList.Items) != 2+concurrent {
+		return fmt.Errorf("expected %d removals, got %d (ledger diverged from subsamples)", 2+concurrent, len(removalList.Items))
+	}
+
+	// Terminated plan and released mother specimen reject further sampling.
+	if err := recordProgress(client, baseURL, plan.ID, 100, "完成制备"); err != nil {
+		return err
+	}
+	if err := expectConflictCode(client, baseURL+"/plans/"+plan.ID+"/removals",
+		removalRequest("SUB-END", 1, "", ""), "plan_not_accepting_removal"); err != nil {
+		return err
+	}
+	if err := requestJSON(client, http.MethodPost, baseURL+"/specimens/"+specimen.ID+"/release",
+		contracts.ReleaseRequest{Purpose: "同位素取样研究", Recipient: "地层研究组", ApprovedBy: "keeper-zhou"},
+		http.StatusCreated, &releaseView{}); err != nil {
+		return err
+	}
+	if err := expectConflictCode(client, baseURL+"/plans/"+plan.ID+"/removals",
+		removalRequest("SUB-AFTER-RELEASE", 1, "", ""), "plan_not_accepting_removal"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func removalRequest(code string, quantity int, parentKind, parentID string) contracts.RecordRemovalRequest {
+	return contracts.RecordRemovalRequest{
+		ParentKind:   parentKind,
+		ParentID:     parentID,
+		Code:         code,
+		Label:        "剥离基质样 " + code,
+		MaterialKind: "matrix",
+		Quantity:     quantity,
+		Notes:        "子样本链路检查",
+		Operator:     "preparator-chen",
+		Purpose:      "薄片与粒度分析",
+	}
+}
+
+func postRemoval(client *http.Client, baseURL, planID string, request contracts.RecordRemovalRequest) (removalResultView, error) {
+	var result removalResultView
+	err := requestJSON(client, http.MethodPost, baseURL+"/plans/"+planID+"/removals",
+		request, http.StatusCreated, &result)
+	return result, err
+}
+
+func expectSpecimenStock(client *http.Client, baseURL, specimenID string, want int) error {
+	var fetched specimenView
+	if err := requestJSON(client, http.MethodGet, baseURL+"/specimens/"+specimenID, nil,
+		http.StatusOK, &fetched); err != nil {
+		return err
+	}
+	if fetched.StockQuantity != want {
+		return fmt.Errorf("expected mother stock %d, got %d", want, fetched.StockQuantity)
+	}
+	return nil
+}
+
+func expectConflictCode(client *http.Client, url string, body any, wantCode string) error {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(encoded))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusConflict {
+		return fmt.Errorf("expected 409 from %s, got %d: %s", url, response.StatusCode, string(raw))
+	}
+	var bodyView errorView
+	if err := json.Unmarshal(raw, &bodyView); err != nil {
+		return err
+	}
+	if bodyView.Code != wantCode {
+		return fmt.Errorf("expected conflict code %s, got %s", wantCode, bodyView.Code)
+	}
+	return nil
+}
+
+var registrationSeq atomic.Int64
+
 func registerSpecimen(client *http.Client, baseURL string) (specimenView, error) {
 	var specimen specimenView
+	catalog := fmt.Sprintf("PPS-2026-%03d", registrationSeq.Add(1))
 	err := requestJSON(
 		client,
 		http.MethodPost,
 		baseURL+"/specimens",
 		contracts.RegisterSpecimenRequest{
-			CatalogNumber: "PPS-2026-001",
+			CatalogNumber: catalog,
 			FieldLabel:    "北坡-07",
 			TaxonHint:     "大型脊椎动物",
 			MatrixKind:    "粉砂岩",

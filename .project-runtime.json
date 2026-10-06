@@ -24,6 +24,10 @@
       "command": "go run ./cmd/workflowcheck --workflow log-preparation"
     },
     {
+      "workflow_id": "register-subsample",
+      "command": "go run ./cmd/workflowcheck --workflow register-subsample"
+    },
+    {
       "workflow_id": "release-for-study",
       "command": "go run ./cmd/workflowcheck --workflow release-for-study"
     }

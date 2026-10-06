@@ -108,6 +108,29 @@
       ]
     },
     {
+      "id": "register-subsample",
+      "name": "Register subsample and material removal",
+      "entry": "POST /plans/{id}/removals",
+      "steps": [
+        "load the active plan, its mother specimen and the requested parent",
+        "verify terminal guards, lineage ownership, acyclic ancestry and unique subsample code",
+        "assign the next contiguous plan-scoped removal step",
+        "commit the removal ledger entry, the subsample identity and the parent stock deduction in one repository mutation"
+      ],
+      "success": "returns the removal record and subsample, keeps the mother specimen current inventory, and exposes traceable lineage",
+      "failure": "returns conflict for terminated plan, released specimen, insufficient stock, duplicate code or cyclic lineage without orphan records",
+      "verification": "workflowcheck samples from a specimen and then a subsample, rejects duplicate and over-stock sampling, runs concurrent removals, and verifies terminal guards plus ledger counts",
+      "module_ids": [
+        "entrypoint",
+        "runtimecheck",
+        "httpapi",
+        "station",
+        "domain",
+        "repository",
+        "contracts"
+      ]
+    },
+    {
       "id": "release-for-study",
       "name": "Release for study",
       "entry": "POST /specimens/{id}/release",

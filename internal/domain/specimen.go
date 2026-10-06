@@ -24,6 +24,7 @@ type Specimen struct {
 	MatrixKind    string         `json:"matrix_kind"`
 	JacketNotes   string         `json:"jacket_notes"`
 	Status        SpecimenStatus `json:"status"`
+	StockQuantity int            `json:"stock_quantity"`
 	Version       int            `json:"version"`
 	CreatedAt     time.Time      `json:"created_at"`
 	UpdatedAt     time.Time      `json:"updated_at"`
@@ -36,6 +37,7 @@ func NewSpecimen(
 	taxonHint string,
 	matrixKind string,
 	jacketNotes string,
+	initialQuantity int,
 	now time.Time,
 ) (Specimen, error) {
 	if id == "" {
@@ -61,6 +63,10 @@ func NewSpecimen(
 	if err != nil {
 		return Specimen{}, err
 	}
+	quantity, err := normalizeInitialQuantity(initialQuantity)
+	if err != nil {
+		return Specimen{}, err
+	}
 	return Specimen{
 		ID:            id,
 		CatalogNumber: catalog,
@@ -69,6 +75,7 @@ func NewSpecimen(
 		MatrixKind:    matrix,
 		JacketNotes:   notes,
 		Status:        SpecimenRegistered,
+		StockQuantity: quantity,
 		Version:       1,
 		CreatedAt:     now.UTC(),
 		UpdatedAt:     now.UTC(),
@@ -81,6 +88,31 @@ func (s Specimen) CanCreatePlan() bool {
 
 func (s Specimen) IsStable() bool {
 	return s.Status == SpecimenStabilized
+}
+
+// IsReleased reports the terminal available state; released specimens can no
+// longer provide material for preparation sampling.
+func (s Specimen) IsReleased() bool {
+	return s.Status == SpecimenAvailable
+}
+
+// CanYieldMaterial is true only while preparation is actively underway.
+func (s Specimen) CanYieldMaterial() bool {
+	return s.Status == SpecimenPreparing
+}
+
+// ConsumeStock deducts sampled units from the current inventory.
+func (s *Specimen) ConsumeStock(quantity int, now time.Time) error {
+	if quantity <= 0 {
+		return contracts.Invalid("invalid_quantity", "去除数量必须大于零")
+	}
+	if quantity > s.StockQuantity {
+		return contracts.Conflict("insufficient_stock", "母标本当前库存不足以完成本次去除")
+	}
+	s.StockQuantity -= quantity
+	s.Version++
+	s.UpdatedAt = now.UTC()
+	return nil
 }
 
 func (s *Specimen) MarkPlanned(now time.Time) error {

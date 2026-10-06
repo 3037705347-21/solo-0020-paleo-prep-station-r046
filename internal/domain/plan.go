@@ -86,6 +86,18 @@ func (p PrepPlan) IsCompleted() bool {
 	return p.Status == PlanCompleted
 }
 
+// IsTerminated reports a plan that can never accept progress or material
+// removal again (completed or cancelled).
+func (p PrepPlan) IsTerminated() bool {
+	return p.Status == PlanCompleted || p.Status == PlanCancelled
+}
+
+// AcceptsRemoval is true only for an active preparation plan. Draft,
+// approved-but-not-started and terminated plans all reject sampling.
+func (p PrepPlan) AcceptsRemoval() bool {
+	return p.Status == PlanActive
+}
+
 func (p *PrepPlan) Approve(approvedBy string, now time.Time) error {
 	if p.Status != PlanDraft {
 		return contracts.Conflict("plan_not_approvable", "只有草稿方案可以审批")

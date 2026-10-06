@@ -23,6 +23,10 @@ func NewRouter(service *station.Service) http.Handler {
 	mux.HandleFunc("GET /plans/{id}", api.getPlan)
 	mux.HandleFunc("POST /plans/{id}/approval", api.approvePlan)
 	mux.HandleFunc("POST /plans/{id}/progress", api.logProgress)
+	mux.HandleFunc("POST /plans/{id}/removals", api.recordRemoval)
+	mux.HandleFunc("GET /subsamples/{id}", api.getSubsample)
+	mux.HandleFunc("GET /specimens/{id}/subsamples", api.listSubsamples)
+	mux.HandleFunc("GET /specimens/{id}/removals", api.listRemovals)
 	return requestIDMiddleware(mux)
 }
 
